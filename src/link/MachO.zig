@@ -275,19 +275,15 @@ pub const SrcFn = struct {
     };
 };
 
-pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Options) !*MachO {
+pub fn openPath(allocator: *Allocator, options: link.Options) !*MachO {
     assert(options.object_format == .macho);
 
-    if (build_options.have_llvm and options.use_llvm) {
-        const self = try createEmpty(allocator, options);
-        errdefer self.base.destroy();
-
-        self.llvm_object = try LlvmObject.create(allocator, sub_path, options);
-        return self;
-    }
-
-    const file = try options.emit.?.directory.handle.createFile(sub_path, .{
-        .truncate = false,
+    const use_stage1 = build_options.is_stage1 and options.use_stage1;
+    const emit = options.emit orelse {
+        return try createEmpty(allocator, options);
+    };
+    const file = try emit.directory.handle.createFile(emit.sub_path, .{
+        .truncate = !use_stage1,
         .read = true,
         .mode = link.determineMode(options),
     });
@@ -301,7 +297,20 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
 
     self.base.file = file;
 
-    if (options.output_mode == .Lib and options.link_mode == .Static) {
+    if (!use_stage1 and build_options.have_llvm and options.use_llvm and options.module != null) {
+        // TODO this intermediary_basename isn't enough; in the case of `zig build-exe`,
+        // we also want to put the intermediary object file in the cache while the
+        // main emit directory is the cwd.
+        const sub_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{
+            emit.sub_path, options.object_format.fileExt(options.target.cpu.arch),
+        });
+        self.llvm_object = try LlvmObject.create(allocator, sub_path, options);
+        self.base.intermediary_basename = sub_path;
+    }
+
+    if (options.output_mode == .Lib and
+        options.link_mode == .Static and self.base.intermediary_basename != null)
+    {
         return self;
     }
 
@@ -376,15 +385,23 @@ pub fn createEmpty(gpa: *Allocator, options: link.Options) !*MachO {
 }
 
 pub fn flush(self: *MachO, comp: *Compilation) !void {
-    if (self.base.options.output_mode == .Lib and self.base.options.link_mode == .Static) {
-        if (build_options.have_llvm) {
-            return self.base.linkAsArchive(comp);
-        } else {
-            log.err("TODO: non-LLVM archiver for MachO object files", .{});
-            return error.TODOImplementWritingStaticLibFiles;
-        }
+    switch (self.base.options.output_mode) {
+        .Exe, .Lib => {
+            if (self.base.options.link_mode == .Static) {
+                if (build_options.have_llvm) {
+                    return self.base.linkAsArchive(comp);
+                } else {
+                    log.err("TODO: non-LLVM archiver for MachO object files", .{});
+                    return error.TODOImplementWritingStaticLibFiles;
+                }
+            }
+            try self.flushModule(comp);
+        },
+        .Obj => try self.flushObject(comp),
     }
+}
 
+pub fn flushModule(self: *MachO, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -410,7 +427,7 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         }
 
         const obj_basename = self.base.intermediary_basename orelse break :blk null;
-        try self.flushModule(comp);
+        try self.flushObject(comp);
         const full_obj_path = try directory.join(arena, &[_][]const u8{obj_basename});
         break :blk full_obj_path;
     } else null;
@@ -527,24 +544,6 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
             try fs.cwd().copyFile(the_object_path, fs.cwd(), full_out_path, .{});
         }
     } else {
-        if (use_stage1) {
-            const sub_path = self.base.options.emit.?.sub_path;
-            self.base.file = try directory.handle.createFile(sub_path, .{
-                .truncate = true,
-                .read = true,
-                .mode = link.determineMode(self.base.options),
-            });
-            try self.populateMissingMetadata();
-            try self.locals.append(self.base.allocator, .{
-                .n_strx = 0,
-                .n_type = macho.N_UNDF,
-                .n_sect = 0,
-                .n_desc = 0,
-                .n_value = 0,
-            });
-            try self.strtab.append(self.base.allocator, 0);
-        }
-
         if (needs_full_relink) {
             for (self.objects.items) |*object| {
                 object.free(self.base.allocator, self);
@@ -887,7 +886,40 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
             sect.offset = 0;
         }
 
-        try self.flushModule(comp);
+        try self.setEntryPoint();
+        try self.updateSectionOrdinals();
+        try self.writeLinkeditSegment();
+
+        if (self.d_sym) |*ds| {
+            // Flush debug symbols bundle.
+            try ds.flushModule(self.base.allocator, self.base.options);
+        }
+
+        if (self.requires_adhoc_codesig) {
+            // Preallocate space for the code signature.
+            // We need to do this at this stage so that we have the load commands with proper values
+            // written out to the file.
+            // The most important here is to have the correct vm and filesize of the __LINKEDIT segment
+            // where the code signature goes into.
+            try self.writeCodeSignaturePadding();
+        }
+
+        try self.writeLoadCommands();
+        try self.writeHeader();
+
+        if (self.entry_addr == null and self.base.options.output_mode == .Exe) {
+            log.debug("flushing. no_entry_point_found = true", .{});
+            self.error_flags.no_entry_point_found = true;
+        } else {
+            log.debug("flushing. no_entry_point_found = false", .{});
+            self.error_flags.no_entry_point_found = false;
+        }
+
+        assert(!self.load_commands_dirty);
+
+        if (self.requires_adhoc_codesig) {
+            try self.writeCodeSignature(); // code signing always comes last
+        }
     }
 
     cache: {
@@ -909,46 +941,14 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
     self.cold_start = false;
 }
 
-pub fn flushModule(self: *MachO, comp: *Compilation) !void {
-    _ = comp;
-
+pub fn flushObject(self: *MachO, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
-    try self.setEntryPoint();
-    try self.updateSectionOrdinals();
-    try self.writeLinkeditSegment();
+    if (build_options.have_llvm)
+        if (self.llvm_object) |llvm_object| return llvm_object.flushModule(comp);
 
-    if (self.d_sym) |*ds| {
-        // Flush debug symbols bundle.
-        try ds.flushModule(self.base.allocator, self.base.options);
-    }
-
-    if (self.requires_adhoc_codesig) {
-        // Preallocate space for the code signature.
-        // We need to do this at this stage so that we have the load commands with proper values
-        // written out to the file.
-        // The most important here is to have the correct vm and filesize of the __LINKEDIT segment
-        // where the code signature goes into.
-        try self.writeCodeSignaturePadding();
-    }
-
-    try self.writeLoadCommands();
-    try self.writeHeader();
-
-    if (self.entry_addr == null and self.base.options.output_mode == .Exe) {
-        log.debug("flushing. no_entry_point_found = true", .{});
-        self.error_flags.no_entry_point_found = true;
-    } else {
-        log.debug("flushing. no_entry_point_found = false", .{});
-        self.error_flags.no_entry_point_found = false;
-    }
-
-    assert(!self.load_commands_dirty);
-
-    if (self.requires_adhoc_codesig) {
-        try self.writeCodeSignature(); // code signing always comes last
-    }
+    return error.TODOImplementWritingObjFiles;
 }
 
 fn resolveSearchDir(
@@ -3035,6 +3035,7 @@ fn growAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, match
 }
 
 pub fn allocateDeclIndexes(self: *MachO, decl: *Module.Decl) !void {
+    if (self.llvm_object) |_| return;
     if (decl.link.macho.local_sym_index != 0) return;
 
     try self.locals.ensureUnusedCapacity(self.base.allocator, 1);
@@ -3458,6 +3459,7 @@ pub fn updateDeclExports(
 }
 
 pub fn deleteExport(self: *MachO, exp: Export) void {
+    if (self.llvm_object) |_| return;
     const sym_index = exp.sym_index orelse return;
     self.globals_free_list.append(self.base.allocator, sym_index) catch {};
     const global = &self.globals.items[sym_index];
