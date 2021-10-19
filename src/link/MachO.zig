@@ -393,7 +393,10 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
             return error.TODOImplementWritingStaticLibFiles;
         }
     }
+    try self.flushModule(comp);
+}
 
+pub fn flushModule(self: *MachO, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -419,7 +422,7 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         }
 
         const obj_basename = self.base.intermediary_basename orelse break :blk null;
-        try self.flushModule(comp);
+        try self.flushObject(comp);
         const full_obj_path = try directory.join(arena, &[_][]const u8{obj_basename});
         break :blk full_obj_path;
     } else null;
@@ -825,26 +828,6 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         try self.createDsoHandleAtom();
         try self.addCodeSignatureLC();
 
-        log.debug("locals:", .{});
-        for (self.locals.items) |sym, id| {
-            log.debug("  {d}: {s}: {}", .{ id, self.getString(sym.n_strx), sym });
-        }
-        log.debug("globals:", .{});
-        for (self.globals.items) |sym, id| {
-            log.debug("  {d}: {s}: {}", .{ id, self.getString(sym.n_strx), sym });
-        }
-        log.debug("undefs:", .{});
-        for (self.undefs.items) |sym, id| {
-            log.debug("  {d}: {s}: {}", .{ id, self.getString(sym.n_strx), sym });
-        }
-        {
-            log.debug("resolver:", .{});
-            var it = self.symbol_resolver.iterator();
-            while (it.next()) |entry| {
-                log.debug("  {s} => {}", .{ self.getString(entry.key_ptr.*), entry.value_ptr.* });
-            }
-        }
-
         for (self.unresolved.keys()) |index| {
             const sym = self.undefs.items[index];
             const sym_name = self.getString(sym.n_strx);
@@ -898,7 +881,40 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
             sect.offset = 0;
         }
 
-        try self.flushModule(comp);
+        try self.setEntryPoint();
+        try self.updateSectionOrdinals();
+        try self.writeLinkeditSegment();
+
+        if (self.d_sym) |*ds| {
+            // Flush debug symbols bundle.
+            try ds.flushModule(self.base.allocator, self.base.options);
+        }
+
+        if (self.requires_adhoc_codesig) {
+            // Preallocate space for the code signature.
+            // We need to do this at this stage so that we have the load commands with proper values
+            // written out to the file.
+            // The most important here is to have the correct vm and filesize of the __LINKEDIT segment
+            // where the code signature goes into.
+            try self.writeCodeSignaturePadding();
+        }
+
+        try self.writeLoadCommands();
+        try self.writeHeader();
+
+        if (self.entry_addr == null and self.base.options.output_mode == .Exe) {
+            log.debug("flushing. no_entry_point_found = true", .{});
+            self.error_flags.no_entry_point_found = true;
+        } else {
+            log.debug("flushing. no_entry_point_found = false", .{});
+            self.error_flags.no_entry_point_found = false;
+        }
+
+        assert(!self.load_commands_dirty);
+
+        if (self.requires_adhoc_codesig) {
+            try self.writeCodeSignature(); // code signing always comes last
+        }
     }
 
     cache: {
@@ -920,52 +936,14 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
     self.cold_start = false;
 }
 
-pub fn flushModule(self: *MachO, comp: *Compilation) !void {
-    _ = comp;
-
+pub fn flushObject(self: *MachO, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
     if (build_options.have_llvm)
-        if (self.llvm_object) |llvm_object| try llvm_object.flushModule(comp);
+        if (self.llvm_object) |llvm_object| return llvm_object.flushModule(comp);
 
-    if (self.base.options.output_mode == .Lib and self.base.options.link_mode == .Static)
-        return;
-
-    try self.setEntryPoint();
-    try self.updateSectionOrdinals();
-    try self.writeLinkeditSegment();
-
-    if (self.d_sym) |*ds| {
-        // Flush debug symbols bundle.
-        try ds.flushModule(self.base.allocator, self.base.options);
-    }
-
-    if (self.requires_adhoc_codesig) {
-        // Preallocate space for the code signature.
-        // We need to do this at this stage so that we have the load commands with proper values
-        // written out to the file.
-        // The most important here is to have the correct vm and filesize of the __LINKEDIT segment
-        // where the code signature goes into.
-        try self.writeCodeSignaturePadding();
-    }
-
-    try self.writeLoadCommands();
-    try self.writeHeader();
-
-    if (self.entry_addr == null and self.base.options.output_mode == .Exe) {
-        log.debug("flushing. no_entry_point_found = true", .{});
-        self.error_flags.no_entry_point_found = true;
-    } else {
-        log.debug("flushing. no_entry_point_found = false", .{});
-        self.error_flags.no_entry_point_found = false;
-    }
-
-    assert(!self.load_commands_dirty);
-
-    if (self.requires_adhoc_codesig) {
-        try self.writeCodeSignature(); // code signing always comes last
-    }
+    return error.TODOImplementWritingObjFiles;
 }
 
 fn resolveSearchDir(

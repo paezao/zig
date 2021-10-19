@@ -580,7 +580,11 @@ pub const File = struct {
                 const full_obj_path = try o_directory.join(arena, &[_][]const u8{obj_basename});
                 break :blk full_obj_path;
             }
-            try base.flushModule(comp);
+            if (base.options.object_format == .macho) {
+                try base.cast(MachO).?.flushObject(comp);
+            } else {
+                try base.flushModule(comp);
+            }
             const obj_basename = base.intermediary_basename.?;
             const full_obj_path = try directory.join(arena, &[_][]const u8{obj_basename});
             break :blk full_obj_path;
