@@ -278,12 +278,12 @@ pub const SrcFn = struct {
 pub fn openPath(allocator: *Allocator, options: link.Options) !*MachO {
     assert(options.object_format == .macho);
 
+    const use_stage1 = build_options.is_stage1 and options.use_stage1;
     const emit = options.emit orelse {
         return try createEmpty(allocator, options);
     };
-
     const file = try emit.directory.handle.createFile(emit.sub_path, .{
-        .truncate = false,
+        .truncate = !use_stage1,
         .read = true,
         .mode = link.determineMode(options),
     });
@@ -297,7 +297,7 @@ pub fn openPath(allocator: *Allocator, options: link.Options) !*MachO {
 
     self.base.file = file;
 
-    if (build_options.have_llvm and options.use_llvm and options.module != null) {
+    if (!use_stage1 and build_options.have_llvm and options.use_llvm and options.module != null) {
         // TODO this intermediary_basename isn't enough; in the case of `zig build-exe`,
         // we also want to put the intermediary object file in the cache while the
         // main emit directory is the cwd.
@@ -385,15 +385,20 @@ pub fn createEmpty(gpa: *Allocator, options: link.Options) !*MachO {
 }
 
 pub fn flush(self: *MachO, comp: *Compilation) !void {
-    if (self.base.options.output_mode == .Lib and self.base.options.link_mode == .Static) {
-        if (build_options.have_llvm) {
-            return self.base.linkAsArchive(comp);
-        } else {
-            log.err("TODO: non-LLVM archiver for MachO object files", .{});
-            return error.TODOImplementWritingStaticLibFiles;
-        }
+    switch (self.base.options.output_mode) {
+        .Exe, .Lib => {
+            if (self.base.options.link_mode == .Static) {
+                if (build_options.have_llvm) {
+                    return self.base.linkAsArchive(comp);
+                } else {
+                    log.err("TODO: non-LLVM archiver for MachO object files", .{});
+                    return error.TODOImplementWritingStaticLibFiles;
+                }
+            }
+            try self.flushModule(comp);
+        },
+        .Obj => try self.flushObject(comp),
     }
-    try self.flushModule(comp);
 }
 
 pub fn flushModule(self: *MachO, comp: *Compilation) !void {
