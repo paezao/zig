@@ -402,7 +402,7 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
     defer tracy.end();
 
     const use_stage1 = build_options.is_stage1 and self.base.options.use_stage1;
-    if (!use_stage1 and self.base.output_mode == .Obj)
+    if (!use_stage1 and self.base.options.output_mode == .Obj)
         return self.flushObject(comp);
 
     var arena_allocator = std.heap.ArenaAllocator.init(self.base.allocator);
