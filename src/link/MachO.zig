@@ -279,11 +279,12 @@ pub fn openPath(allocator: *Allocator, options: link.Options) !*MachO {
     assert(options.object_format == .macho);
 
     const use_stage1 = build_options.is_stage1 and options.use_stage1;
-    const emit = options.emit orelse {
-        return try createEmpty(allocator, options);
-    };
+    if (use_stage1 or options.emit == null) {
+        return createEmpty(allocator, options);
+    }
+    const emit = options.emit.?;
     const file = try emit.directory.handle.createFile(emit.sub_path, .{
-        .truncate = !use_stage1,
+        .truncate = false,
         .read = true,
         .mode = link.determineMode(options),
     });
@@ -297,7 +298,7 @@ pub fn openPath(allocator: *Allocator, options: link.Options) !*MachO {
 
     self.base.file = file;
 
-    if (!use_stage1 and build_options.have_llvm and options.use_llvm and options.module != null) {
+    if (build_options.have_llvm and options.use_llvm and options.module != null) {
         // TODO this intermediary_basename isn't enough; in the case of `zig build-exe`,
         // we also want to put the intermediary object file in the cache while the
         // main emit directory is the cwd.
@@ -385,32 +386,30 @@ pub fn createEmpty(gpa: *Allocator, options: link.Options) !*MachO {
 }
 
 pub fn flush(self: *MachO, comp: *Compilation) !void {
-    switch (self.base.options.output_mode) {
-        .Exe, .Lib => {
-            if (self.base.options.link_mode == .Static) {
-                if (build_options.have_llvm) {
-                    return self.base.linkAsArchive(comp);
-                } else {
-                    log.err("TODO: non-LLVM archiver for MachO object files", .{});
-                    return error.TODOImplementWritingStaticLibFiles;
-                }
-            }
-            try self.flushModule(comp);
-        },
-        .Obj => try self.flushObject(comp),
+    if (self.base.options.output_mode == .Lib and self.base.options.link_mode == .Static) {
+        if (build_options.have_llvm) {
+            return self.base.linkAsArchive(comp);
+        } else {
+            log.err("TODO: non-LLVM archiver for MachO object files", .{});
+            return error.TODOImplementWritingStaticLibFiles;
+        }
     }
+    try self.flushModule(comp);
 }
 
 pub fn flushModule(self: *MachO, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
+    const use_stage1 = build_options.is_stage1 and self.base.options.use_stage1;
+    if (!use_stage1 and self.base.output_mode == .Obj)
+        return self.flushObject(comp);
+
     var arena_allocator = std.heap.ArenaAllocator.init(self.base.allocator);
     defer arena_allocator.deinit();
     const arena = &arena_allocator.allocator;
 
     const directory = self.base.options.emit.?.directory; // Just an alias to make it shorter to type.
-    const use_stage1 = build_options.is_stage1 and self.base.options.use_stage1;
 
     // If there is no Zig code to compile, then we should skip flushing the output file because it
     // will not be part of the linker line anyway.
@@ -544,6 +543,25 @@ pub fn flushModule(self: *MachO, comp: *Compilation) !void {
             try fs.cwd().copyFile(the_object_path, fs.cwd(), full_out_path, .{});
         }
     } else {
+        if (use_stage1) {
+            const sub_path = self.base.options.emit.?.sub_path;
+            self.base.file = try directory.handle.createFile(sub_path, .{
+                .truncate = true,
+                .read = true,
+                .mode = link.determineMode(self.base.options),
+            });
+            // Index 0 is always a null symbol.
+            try self.locals.append(self.base.allocator, .{
+                .n_strx = 0,
+                .n_type = 0,
+                .n_sect = 0,
+                .n_desc = 0,
+                .n_value = 0,
+            });
+            try self.strtab.append(self.base.allocator, 0);
+            try self.populateMissingMetadata();
+        }
+
         if (needs_full_relink) {
             for (self.objects.items) |*object| {
                 object.free(self.base.allocator, self);
